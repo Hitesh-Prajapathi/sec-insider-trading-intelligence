@@ -72,7 +72,11 @@ class EdgarSource:
                     "SEC_USER_AGENT is not set (or is still the placeholder). SEC requires a descriptive "
                     "User-Agent with contact info, e.g. SEC_USER_AGENT='your-app-name you@example.com'"
                 )
-            self._client = EdgarClient(user_agent=self.settings.sec_user_agent, cache_dir=self.settings.edgar_cache_dir)
+            self._client = EdgarClient(
+                user_agent=self.settings.sec_user_agent,
+                cache_dir=self.settings.edgar_cache_dir,
+                rate_per_sec=self.settings.sec_rate_per_sec,
+            )
         return self._client
 
     def entries(self, day: date) -> list[IndexEntry]:

@@ -4,6 +4,10 @@
   with a clear error if it is missing (unless an httpx client/transport is injected, e.g. in tests).
 * Token-bucket rate limit, hard-capped at 8 requests/second (SEC allows 10).
 * Exponential backoff (honouring ``Retry-After``) on 429 / 5xx / timeouts / transport errors.
+* 403 cooldown: SEC blocks an IP for ~10 minutes when it decides traffic is too heavy. If an earlier request
+  in this session succeeded (so the User-Agent is accepted), a 403 waits ``block_cooldown`` seconds and
+  retries, at most ``max_block_cooldowns`` times per client. A 403 on the very first request (bad or
+  missing User-Agent) still fails immediately.
 * Immutable on-disk cache of filing documents: ``<cache_dir>/<accession>.xml`` (+ ``.meta.json``).
   Filings never change, so a filing is fetched once and then re-parsed offline.
 
@@ -12,6 +16,7 @@ Nothing here runs at import time: no env reads, no network.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -21,7 +26,15 @@ from pathlib import Path
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 MAX_RATE_PER_SEC = 8.0
+BLOCK_COOLDOWN_S = 600.0  # SEC: "traffic exceeding the limit ... will be limited for 10 minutes"
+# Phrases from SEC's 403 page, used only to make the error message say which kind of block it is.
+_BLOCK_REASONS = (
+    ("Request Rate Threshold Exceeded", "rate threshold exceeded"),
+    ("Undeclared Automated Tool", "User-Agent not accepted as a declared automated tool"),
+)
 DEFAULT_CACHE_DIR = Path("data/raw/edgar")
 USER_AGENT_ENV = "SEC_USER_AGENT"
 _ACCESSION_RE = re.compile(r"^\d{10}-\d{2}-\d{6}$")
@@ -100,6 +113,8 @@ class EdgarClient:
         max_retries: int = 5,
         backoff_base: float = 0.5,
         backoff_max: float = 30.0,
+        block_cooldown: float = BLOCK_COOLDOWN_S,
+        max_block_cooldowns: int = 2,
         timeout: float = 30.0,
         client: httpx.Client | None = None,
         transport: httpx.BaseTransport | None = None,
@@ -119,6 +134,10 @@ class EdgarClient:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
+        self.block_cooldown = block_cooldown
+        self.max_block_cooldowns = max_block_cooldowns
+        self.block_cooldowns_used = 0
+        self._had_success = False  # a 2xx proves the User-Agent is accepted; only then is a 403 worth waiting out
         self.timeout = timeout
         self._sleep = sleep
         self._bucket = TokenBucket(rate_per_sec, 1.0, clock, sleep)
@@ -153,7 +172,27 @@ class EdgarClient:
         return min(self.backoff_base * (2**attempt), self.backoff_max)
 
     def get(self, url: str) -> httpx.Response:
-        """Rate-limited GET with retries. Returns a 2xx response or raises an EdgarError."""
+        """Rate-limited GET with retries and 403 cooldowns. Returns a 2xx response or raises an EdgarError."""
+        while True:
+            try:
+                resp = self._get_with_retries(url)
+            except EdgarBlockedError as exc:
+                if not self._had_success or self.block_cooldowns_used >= self.max_block_cooldowns:
+                    raise
+                self.block_cooldowns_used += 1
+                logger.warning(
+                    "SEC returned 403 (%s); cooling down %.0fs before retrying (cooldown %d/%d)",
+                    exc,
+                    self.block_cooldown,
+                    self.block_cooldowns_used,
+                    self.max_block_cooldowns,
+                )
+                self._sleep(self.block_cooldown)
+                continue
+            self._had_success = True
+            return resp
+
+    def _get_with_retries(self, url: str) -> httpx.Response:
         last: Exception | None = None
         for attempt in range(self.max_retries + 1):
             self._bucket.acquire()
@@ -169,9 +208,10 @@ class EdgarClient:
                 if code < 300:
                     return resp
                 if code == 403:
-                    raise EdgarBlockedError(
-                        f"403 from {url}: SEC blocked the request (check {USER_AGENT_ENV} / rate)", code, url
-                    )
+                    body = resp.text or ""
+                    reason = next((r for phrase, r in _BLOCK_REASONS if phrase in body), None)
+                    hint = reason or f"check {USER_AGENT_ENV} / rate"
+                    raise EdgarBlockedError(f"403 from {url}: SEC blocked the request ({hint})", code, url)
                 if code == 404:
                     raise EdgarNotFound(f"404 not found: {url}", code, url)
                 if code not in RETRY_STATUSES:

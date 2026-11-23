@@ -14,6 +14,7 @@ def _is_placeholder(value: str) -> bool:
 class Settings(BaseSettings):
     # ── SEC EDGAR (no API key; a descriptive User-Agent with contact info is mandatory) ──────────────
     sec_user_agent: str = ""  # env SEC_USER_AGENT, e.g. "your-app-name your-email@example.com"
+    sec_rate_per_sec: float = 8.0  # env SEC_RATE_PER_SEC; hard-capped at 8 by EdgarClient (SEC allows 10)
 
     # ── API keys ────────────────────────────────────────────────────────────
     openrouter_api_key: str = ""

@@ -144,10 +144,54 @@ def test_403_is_not_retried(tmp_path):
         n["i"] += 1
         return httpx.Response(403)
 
-    c, _ = make(handler, tmp_path)
+    c, ft = make(handler, tmp_path)
     with pytest.raises(EdgarBlockedError):
         c.get("https://www.sec.gov/x")
-    assert n["i"] == 1
+    assert n["i"] == 1  # first request: a bad User-Agent must fail fast, no cooldown
+    assert 600.0 not in ft.sleeps
+
+
+def test_403_after_success_cools_down_then_retries(tmp_path):
+    codes = iter([200, 403, 200])
+    c, ft = make(lambda req: httpx.Response(next(codes), text="ok"), tmp_path)
+    c.get("https://www.sec.gov/a")
+    assert c.get("https://www.sec.gov/b").text == "ok"
+    assert ft.sleeps.count(600.0) == 1
+    assert c.block_cooldowns_used == 1
+
+
+def test_403_gives_up_after_max_cooldowns(tmp_path):
+    n = {"i": 0}
+
+    def handler(req):
+        n["i"] += 1
+        return httpx.Response(200 if n["i"] == 1 else 403)
+
+    c, ft = make(handler, tmp_path, max_block_cooldowns=2)
+    c.get("https://www.sec.gov/a")
+    with pytest.raises(EdgarBlockedError):
+        c.get("https://www.sec.gov/b")
+    assert n["i"] == 1 + 3  # one success, then the 403 plus two retries after cooldowns
+    assert ft.sleeps.count(600.0) == 2
+
+
+def test_403_message_names_sec_reason(tmp_path):
+    page = "<html><h1>Your Request Originates from an Undeclared Automated Tool</h1></html>"
+    c, _ = make(lambda req: httpx.Response(403, text=page), tmp_path)
+    with pytest.raises(EdgarBlockedError, match="declared automated tool"):
+        c.get("https://www.sec.gov/x")
+
+
+def test_edgar_source_uses_configured_rate(tmp_path):
+    from insider_intel.config import Settings
+    from insider_intel.pipeline.ingest import EdgarSource
+
+    s = Settings(sec_user_agent="Acme Research ops@acme.org", sec_rate_per_sec=4, edgar_cache_dir=str(tmp_path))
+    src = EdgarSource(s)
+    try:
+        assert src.client._bucket.rate == 4.0
+    finally:
+        src.close()
 
 
 def test_404_raises_not_found_without_retry(tmp_path):
