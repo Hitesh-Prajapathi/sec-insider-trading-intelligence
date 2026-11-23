@@ -28,9 +28,11 @@ permissions:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 180   # each run catches up ~2 weeks of Form 4s (~10-15k filings at <=8 req/s)
+    timeout-minutes: 180   # ~2 weeks of Form 4s (~10-15k filings) at 4 req/s is ~1 h, plus up to 2 x 10 min cooldowns
     env:
       SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      # Shared GitHub runner IPs get throttled by SEC well below its 10 req/s limit; run CI at half the local cap.
+      SEC_RATE_PER_SEC: "4"
       GH_TOKEN: ${{ github.token }}
       LIVE_DB_PATH: ./data/live.duckdb
     steps:
@@ -45,8 +47,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
       - name: Require SEC_USER_AGENT
+        # SEC fair-access format: "Sample Company Name AdminContact@domain.com". The value itself is never printed.
+        shell: bash
         run: |
           if [ -z "$SEC_USER_AGENT" ]; then echo "::error::SEC_USER_AGENT secret is not set"; exit 1; fi
+          re='^[^[:space:]@].*[[:space:]][^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}([[:space:]]|$)'
+          if ! [[ "$SEC_USER_AGENT" =~ $re ]]; then
+            echo "::error::SEC_USER_AGENT must be 'Name email@domain.tld' (a name, a space, then a contact email)"; exit 1
+          fi
+          case "${SEC_USER_AGENT,,}" in
+            *example.com*|*your-app-name*|*your-email*) echo "::error::SEC_USER_AGENT is still the placeholder"; exit 1;;
+          esac
       - name: Restore previous snapshot
         run: |
           mkdir -p data
